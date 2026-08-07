@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/md5" // 【新增】用于黑石逻辑
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -43,6 +44,9 @@ func init() {
 	C.RegisterMethod(MethodList, NewMethod)
 }
 
+// 【新增】黑石模式全局开关
+var EnableBlackstoneHack = false
+
 type Method struct {
 	keySaltLength         int
 	timeFunc              func() time.Time
@@ -53,19 +57,34 @@ type Method struct {
 	udpBlockDecryptCipher cipher.Block
 	pskList               [][]byte
 	pskHash               []byte
+	// 【新增】保存原始密码用于判断
+	rawPassword string
 }
 
 func NewMethod(methodName string, options C.MethodOptions) (C.Method, error) {
 	m := &Method{
-		timeFunc: options.TimeFunc,
-		pskList:  options.KeyList,
+		timeFunc:    options.TimeFunc,
+		pskList:     options.KeyList,
+		rawPassword: options.Password, // 【新增】记录原始密码
 	}
+
+	// 【新增】触发逻辑检测
+	if strings.Contains(options.Password, "BLACKSTONE") {
+		EnableBlackstoneHack = true
+	}
+
 	if options.Password != "" {
 		var pskList [][]byte
 		keyStrList := strings.Split(options.Password, ":")
 		pskList = make([][]byte, len(keyStrList))
 		for i, keyStr := range keyStrList {
-			kb, err := base64.StdEncoding.DecodeString(keyStr)
+			// 【新增】清洗 Tag (例如 #A区...)
+			cleanKeyStr := keyStr
+			if idx := strings.Index(cleanKeyStr, "#"); idx != -1 {
+				cleanKeyStr = cleanKeyStr[:idx]
+			}
+
+			kb, err := base64.StdEncoding.DecodeString(cleanKeyStr)
 			if err != nil {
 				return nil, E.Cause(err, "decode key")
 			}
@@ -195,12 +214,15 @@ type clientConn struct {
 	shadowio.WriterInterface
 }
 
+// 【核心修改】writeRequest 函数：注入 MagicCode 逻辑
 func (c *clientConn) writeRequest(payload []byte) error {
 	requestSalt := make([]byte, c.method.keySaltLength)
 	requestBuffer := buf.New()
 	defer requestBuffer.Release()
+
 	requestBuffer.WriteRandom(c.method.keySaltLength)
 	copy(requestSalt, requestBuffer.Bytes())
+
 	key := SessionKey(c.method.pskList[len(c.method.pskList)-1], requestSalt, c.method.keySaltLength)
 	writeCipher, err := c.method.constructor(key)
 	if err != nil {
@@ -212,13 +234,34 @@ func (c *clientConn) writeRequest(payload []byte) error {
 		nil,
 		buf.BufferSize-shadowio.PacketLengthBufferSize-shadowio.Overhead*2,
 	)
+
 	err = c.method.writeExtendedIdentityHeaders(requestBuffer, requestBuffer.To(c.method.keySaltLength))
 	if err != nil {
 		return err
 	}
-	fixedLengthBuffer := buf.With(requestBuffer.Extend(RequestHeaderFixedChunkLength + shadowio.Overhead))
+
+	// 1. 准备 MagicCode
+	isBlackstone := strings.Contains(c.method.rawPassword, "BLACKSTONE")
+	magicCode := []byte{}
+	if isBlackstone {
+		targetKey := c.method.pskList[len(c.method.pskList)-1]
+		b64Key := base64.StdEncoding.EncodeToString(targetKey)
+		hash := md5.Sum([]byte(b64Key))
+		magicCode = hash[:]
+	}
+
+	// 2. 构造 Header 长度
+	headerLen := RequestHeaderFixedChunkLength
+	if len(magicCode) > 0 {
+		headerLen += len(magicCode)
+	}
+
+	fixedLengthBuffer := buf.With(requestBuffer.Extend(headerLen + shadowio.Overhead))
+
+	// 3. 写入标准 Header
 	common.Must(fixedLengthBuffer.WriteByte(HeaderTypeClient))
 	common.Must(binary.Write(fixedLengthBuffer, binary.BigEndian, uint64(c.method.time().Unix())))
+
 	variableLengthHeaderLen := M.SocksaddrSerializer.AddrPortLen(c.destination) + 2
 	var paddingLen int
 	if len(payload) < MaxPaddingLength {
@@ -231,7 +274,15 @@ func (c *clientConn) writeRequest(payload []byte) error {
 		payloadLen = maxPayloadLen
 	}
 	variableLengthHeaderLen += payloadLen
+
 	common.Must(binary.Write(fixedLengthBuffer, binary.BigEndian, uint16(variableLengthHeaderLen)))
+
+	// 4. 【关键】写入 MagicCode (紧跟在 Length 后面)
+	if len(magicCode) > 0 {
+		common.Must1(fixedLengthBuffer.Write(magicCode))
+	}
+
+	// 5. 加密 (范围包含标准头 + MagicCode)
 	writer.Encrypt(fixedLengthBuffer.Index(0), fixedLengthBuffer.Bytes())
 	fixedLengthBuffer.Extend(shadowio.Overhead)
 
@@ -249,6 +300,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 	}
 	writer.Encrypt(variableLengthBuffer.Index(0), variableLengthBuffer.Bytes())
 	variableLengthBuffer.Extend(shadowio.Overhead)
+
 	_, err = c.Conn.Write(requestBuffer.Bytes())
 	if err != nil {
 		return err
@@ -264,6 +316,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 	return nil
 }
 
+// ... 以下内容保持原文件不变 ...
 func (m *Method) writeExtendedIdentityHeaders(request *buf.Buffer, salt []byte) error {
 	pskLen := len(m.pskList)
 	if pskLen < 2 {

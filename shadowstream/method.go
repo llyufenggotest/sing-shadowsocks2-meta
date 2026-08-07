@@ -4,12 +4,14 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/rc4"
+	"io"
 	"net"
 	"os"
+	"strings"
 
 	C "github.com/metacubex/sing-shadowsocks2/cipher"
-	"github.com/metacubex/sing-shadowsocks2/internal/legacykey"
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
@@ -37,16 +39,33 @@ func init() {
 	C.RegisterMethod(MethodList, NewMethod)
 }
 
+// 对齐 Python 的 derive_key 逻辑
+func pythonDeriveKey(password []byte, keyLen int) []byte {
+	var d []byte
+	var di []byte
+	for len(d) < keyLen {
+		h := md5.New()
+		h.Write(di)
+		h.Write(password)
+		di = h.Sum(nil)
+		d = append(d, di...)
+	}
+	return d[:keyLen]
+}
+
 type Method struct {
 	keyLength          int
 	saltLength         int
 	encryptConstructor func(key []byte, salt []byte) (cipher.Stream, error)
 	decryptConstructor func(key []byte, salt []byte) (cipher.Stream, error)
 	key                []byte
+	password           string // 保存原始密码用于逻辑判断
 }
 
 func NewMethod(methodName string, options C.MethodOptions) (C.Method, error) {
-	m := &Method{}
+	m := &Method{
+		password: options.Password,
+	}
 	switch methodName {
 	case "aes-128-ctr":
 		m.keyLength = 16
@@ -123,12 +142,19 @@ func NewMethod(methodName string, options C.MethodOptions) (C.Method, error) {
 	default:
 		return nil, os.ErrInvalid
 	}
+
+	// 清理干扰词获取真实密码
+	cleanPassword := strings.ReplaceAll(options.Password, "BLACKSTONE", "")
+	if idx := strings.Index(cleanPassword, "#"); idx != -1 {
+		cleanPassword = cleanPassword[:idx]
+	}
+
 	if len(options.Key) == m.keyLength {
 		m.key = options.Key
 	} else if len(options.Key) > 0 {
 		return nil, E.New("bad key length, required ", m.keyLength, ", got ", len(options.Key))
-	} else if options.Password != "" {
-		m.key = legacykey.Key([]byte(options.Password), m.keyLength)
+	} else if cleanPassword != "" {
+		m.key = pythonDeriveKey([]byte(cleanPassword), m.keyLength)
 	} else {
 		return nil, C.ErrMissingPassword
 	}
@@ -178,6 +204,41 @@ type clientConn struct {
 }
 
 func (c *clientConn) readResponse() error {
+	if c.readStream != nil {
+		return nil
+	}
+
+	// --- 黑石下行剥皮逻辑 ---
+	if strings.Contains(c.method.password, "BLACKSTONE") {
+		magic := make([]byte, 2)
+		if _, err := io.ReadFull(c.ExtendedConn, magic); err != nil {
+			return err
+		}
+
+		padLen := int(magic[1])
+		if padLen > 0 {
+			if _, err := io.CopyN(io.Discard, c.ExtendedConn, int64(padLen)); err != nil {
+				return err
+			}
+		}
+
+		// 丢弃 17 字节 Token
+		if _, err := io.CopyN(io.Discard, c.ExtendedConn, 17); err != nil {
+			return err
+		}
+
+		// 真实 IV
+		salt := make([]byte, c.method.saltLength)
+		if _, err := io.ReadFull(c.ExtendedConn, salt); err != nil {
+			return err
+		}
+
+		var err error
+		c.readStream, err = c.method.decryptConstructor(c.method.key, salt)
+		return err
+	}
+
+	// --- 原版标准流程 ---
 	saltBuffer := buf.NewSize(c.method.saltLength)
 	defer saltBuffer.Release()
 	_, err := saltBuffer.ReadFullFrom(c.ExtendedConn, c.method.saltLength)
@@ -205,6 +266,54 @@ func (c *clientConn) Read(p []byte) (n int, err error) {
 
 func (c *clientConn) Write(p []byte) (n int, err error) {
 	if c.writeStream == nil {
+		if strings.Contains(c.method.password, "BLACKSTONE") {
+			cleanPass := strings.ReplaceAll(c.method.password, "BLACKSTONE", "")
+			if idx := strings.Index(cleanPass, "#"); idx != -1 {
+				cleanPass = cleanPass[:idx]
+			}
+			token := md5.Sum([]byte(cleanPass + "_onesocks"))
+
+			salt := make([]byte, c.method.saltLength)
+			common.Must1(io.ReadFull(rand.Reader, salt))
+
+			header := make([]byte, 35)
+			header[0] = 0x01
+			header[1] = 0x00
+			copy(header[2:18], token[:])
+			header[18] = 0x10
+			copy(header[19:35], salt)
+
+			// 预先写入明文的魔改头
+			if _, err := c.ExtendedConn.Write(header); err != nil {
+				return 0, err
+			}
+
+			c.writeStream, err = c.method.encryptConstructor(c.method.key, salt)
+			if err != nil {
+				return 0, err
+			}
+
+			addrLen := M.SocksaddrSerializer.AddrPortLen(c.destination)
+			buffer := buf.NewSize(addrLen + len(p))
+			defer buffer.Release()
+
+			err = M.SocksaddrSerializer.WriteAddrPort(buffer, c.destination)
+			if err != nil {
+				return 0, err
+			}
+			if len(p) > 0 {
+				_, _ = buffer.Write(p)
+			}
+
+			c.writeStream.XORKeyStream(buffer.Bytes(), buffer.Bytes())
+			_, err = c.ExtendedConn.Write(buffer.Bytes())
+			if err == nil {
+				n = len(p)
+			}
+			return
+		}
+
+		// 原版逻辑
 		buffer := buf.NewSize(c.method.saltLength + M.SocksaddrSerializer.AddrPortLen(c.destination) + len(p))
 		defer buffer.Release()
 		buffer.WriteRandom(c.method.saltLength)
@@ -212,7 +321,7 @@ func (c *clientConn) Write(p []byte) (n int, err error) {
 		if err != nil {
 			return
 		}
-		common.Must1(buffer.Write(p))
+		_, _ = buffer.Write(p)
 		c.writeStream, err = c.method.encryptConstructor(c.method.key, buffer.To(c.method.saltLength))
 		if err != nil {
 			return
@@ -245,6 +354,45 @@ func (c *clientConn) ReadBuffer(buffer *buf.Buffer) error {
 
 func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
 	if c.writeStream == nil {
+		if strings.Contains(c.method.password, "BLACKSTONE") {
+			cleanPass := strings.ReplaceAll(c.method.password, "BLACKSTONE", "")
+			if idx := strings.Index(cleanPass, "#"); idx != -1 {
+				cleanPass = cleanPass[:idx]
+			}
+			token := md5.Sum([]byte(cleanPass + "_onesocks"))
+
+			salt := make([]byte, c.method.saltLength)
+			common.Must1(io.ReadFull(rand.Reader, salt))
+
+			header := make([]byte, 35)
+			header[0] = 0x01
+			header[1] = 0x00
+			copy(header[2:18], token[:])
+			header[18] = 0x10
+			copy(header[19:35], salt)
+
+			if _, err := c.ExtendedConn.Write(header); err != nil {
+				return err
+			}
+
+			var err error
+			c.writeStream, err = c.method.encryptConstructor(c.method.key, salt)
+			if err != nil {
+				return err
+			}
+
+			addrLen := M.SocksaddrSerializer.AddrPortLen(c.destination)
+			addrHeader := buf.With(buffer.ExtendHeader(addrLen))
+			err = M.SocksaddrSerializer.WriteAddrPort(addrHeader, c.destination)
+			if err != nil {
+				return err
+			}
+
+			c.writeStream.XORKeyStream(buffer.Bytes(), buffer.Bytes())
+			return c.ExtendedConn.WriteBuffer(buffer)
+		}
+
+		// 原版逻辑
 		header := buf.With(buffer.ExtendHeader(c.method.saltLength + M.SocksaddrSerializer.AddrPortLen(c.destination)))
 		header.WriteRandom(c.method.saltLength)
 		err := M.SocksaddrSerializer.WriteAddrPort(header, c.destination)
@@ -264,6 +412,9 @@ func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
 
 func (c *clientConn) FrontHeadroom() int {
 	if c.writeStream == nil {
+		if strings.Contains(c.method.password, "BLACKSTONE") {
+			return M.SocksaddrSerializer.AddrPortLen(c.destination)
+		}
 		return c.method.saltLength + M.SocksaddrSerializer.AddrPortLen(c.destination)
 	}
 	return 0
@@ -348,6 +499,7 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if err != nil {
 		return
 	}
+	_, _ = buffer.Write(p)
 	stream, err := c.method.encryptConstructor(c.method.key, buffer.To(c.method.saltLength))
 	if err != nil {
 		return
