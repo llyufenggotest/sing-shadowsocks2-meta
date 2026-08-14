@@ -44,9 +44,6 @@ func init() {
 	C.RegisterMethod(MethodList, NewMethod)
 }
 
-// 【新增】黑石模式全局开关
-var EnableBlackstoneHack = false
-
 type Method struct {
 	keySaltLength         int
 	timeFunc              func() time.Time
@@ -69,9 +66,7 @@ func NewMethod(methodName string, options C.MethodOptions) (C.Method, error) {
 	}
 
 	// 【新增】触发逻辑检测
-	if strings.Contains(options.Password, "BLACKSTONE") {
-		EnableBlackstoneHack = true
-	}
+
 
 	if options.Password != "" {
 		var pskList [][]byte

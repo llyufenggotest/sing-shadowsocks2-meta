@@ -2,11 +2,12 @@ package cipher
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"io"
 	"math/rand"
 	"net"
 	"strings"
-	"time"
 
 	E "github.com/metacubex/sing/common/exceptions"
 	M "github.com/metacubex/sing/common/metadata"
@@ -34,21 +35,7 @@ func CreateMethod(methodName string, options MethodOptions) (Method, error) {
 		return nil, E.New("unknown method: ", methodName)
 	}
 
-	pwd := options.Password
-	upperPwd := strings.ToUpper(pwd)
-	var actualToken string
-	isViewTurboNode := false
-
-	// 识别专线节点标记
-	if strings.HasSuffix(upperPwd, "#VT") {
-		isViewTurboNode = true
-		actualToken = pwd[:len(pwd)-3]
-	} else if strings.HasSuffix(upperPwd, "VT") {
-		if len(pwd) == 34 {
-			isViewTurboNode = true
-			actualToken = pwd[:len(pwd)-2]
-		}
-	}
+	actualToken, isViewTurboNode := parseViewTurboPassword(options.Password)
 
 	if isViewTurboNode {
 		// 💥 强制使用官方底层硬编码密码走原生 MD5 流程
@@ -70,6 +57,17 @@ func CreateMethod(methodName string, options MethodOptions) (Method, error) {
 	}
 
 	return origMethod, nil
+}
+
+func parseViewTurboPassword(password string) (string, bool) {
+	upperPassword := strings.ToUpper(password)
+	if strings.HasSuffix(upperPassword, "#VT") {
+		return password[:len(password)-3], true
+	}
+	if len(password) == 34 && strings.HasSuffix(upperPassword, "VT") {
+		return password[:len(password)-2], true
+	}
+	return password, false
 }
 
 type viewTurboMethodWrapper struct {
@@ -100,6 +98,7 @@ type viewTurboConn struct {
 	firstWrite bool
 	firstRead  bool
 	leftover   []byte // 💥 性能优化：存放“大口读”时多出来的真实数据
+	random     *rand.Rand
 }
 
 func wrapViewTurboConn(c net.Conn, token string) net.Conn {
@@ -109,18 +108,27 @@ func wrapViewTurboConn(c net.Conn, token string) net.Conn {
 		firstWrite: true,
 		firstRead:  true,
 		leftover:   nil,
+		random:     rand.New(rand.NewSource(randomSeed())),
 	}
 }
 
-func randomString(min, max int) string {
+func randomSeed() int64 {
+	var seed [8]byte
+	if _, err := cryptorand.Read(seed[:]); err == nil {
+		return int64(binary.LittleEndian.Uint64(seed[:]))
+	}
+	return int64(binary.LittleEndian.Uint64([]byte("ViewTurb")))
+}
+
+func (c *viewTurboConn) randomString(min, max int) string {
 	length := min
 	if max > min {
-		length = rand.Intn(max-min+1) + min
+		length = c.random.Intn(max-min+1) + min
 	}
 	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 	b := make([]rune, length)
 	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
+		b[i] = letters[c.random.Intn(len(letters))]
 	}
 	return string(b)
 }
@@ -130,11 +138,10 @@ func (c *viewTurboConn) Write(b []byte) (int, error) {
 	if c.firstWrite {
 		if len(b) >= 32 {
 			c.firstWrite = false
-			rand.Seed(time.Now().UnixNano())
 
 			// 🛡️ 修复核心 1: 恢复假头的长度随机性！(例如 20~25 字节随机字母 + 4字节换行)
 			// 这样第一个包的总长度会在 24~29 字节之间不断跳动，彻底摧毁固定长度指纹！
-			fakeHeader := randomString(20, 25) + "\r\n\r\n"
+			fakeHeader := c.randomString(20, 25) + "\r\n\r\n"
 			_, err := c.Conn.Write([]byte(fakeHeader))
 			if err != nil {
 				return 0, err
@@ -142,7 +149,7 @@ func (c *viewTurboConn) Write(b []byte) (int, error) {
 
 			// 官方特征 2: 发送严格的 60 字节 Token 块 (这个必须固定，因为是解密密钥)
 			tokenBlock := make([]byte, 60)
-			copy(tokenBlock, []byte(randomString(60, 60)))
+			copy(tokenBlock, []byte(c.randomString(60, 60)))
 			tokenBytes := []byte(c.token)
 			copy(tokenBlock, tokenBytes)
 			if len(tokenBytes) < 60 {
@@ -167,7 +174,7 @@ func (c *viewTurboConn) Write(b []byte) (int, error) {
 			rem := b[32:]
 			if len(rem) > 0 {
 				// 动态切片：50~80 字节之间跳动
-				splitSize := rand.Intn(30) + 50
+				splitSize := c.random.Intn(30) + 50
 				if len(rem) < splitSize {
 					splitSize = len(rem)
 				}
