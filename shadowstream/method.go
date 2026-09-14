@@ -35,6 +35,8 @@ var MethodList = []string{
 	"chacha20",
 }
 
+var blackstoneRandReader io.Reader = rand.Reader
+
 func init() {
 	C.RegisterMethod(MethodList, NewMethod)
 }
@@ -214,6 +216,9 @@ func (c *clientConn) readResponse() error {
 		if _, err := io.ReadFull(c.ExtendedConn, magic); err != nil {
 			return err
 		}
+		if magic[0] != 0x01 {
+			return E.New("invalid BLACKSTONE response magic: ", magic[0])
+		}
 
 		padLen := int(magic[1])
 		if padLen > 0 {
@@ -274,7 +279,7 @@ func (c *clientConn) Write(p []byte) (n int, err error) {
 			token := md5.Sum([]byte(cleanPass + "_onesocks"))
 
 			salt := make([]byte, c.method.saltLength)
-			common.Must1(io.ReadFull(rand.Reader, salt))
+			common.Must1(io.ReadFull(blackstoneRandReader, salt))
 
 			header := make([]byte, 35)
 			header[0] = 0x01
@@ -362,7 +367,7 @@ func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
 			token := md5.Sum([]byte(cleanPass + "_onesocks"))
 
 			salt := make([]byte, c.method.saltLength)
-			common.Must1(io.ReadFull(rand.Reader, salt))
+			common.Must1(io.ReadFull(blackstoneRandReader, salt))
 
 			header := make([]byte, 35)
 			header[0] = 0x01
