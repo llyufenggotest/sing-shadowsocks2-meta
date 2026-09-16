@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"strings"
 
 	C "github.com/metacubex/sing-shadowsocks2/cipher"
 	"github.com/metacubex/sing/common"
@@ -61,12 +60,15 @@ type Method struct {
 	encryptConstructor func(key []byte, salt []byte) (cipher.Stream, error)
 	decryptConstructor func(key []byte, salt []byte) (cipher.Stream, error)
 	key                []byte
-	password           string // 保存原始密码用于逻辑判断
+	password           string
+	blackstone         bool
 }
 
 func NewMethod(methodName string, options C.MethodOptions) (C.Method, error) {
+	cleanPassword, blackstone := C.ParseBlackstonePassword(options.Password)
 	m := &Method{
-		password: options.Password,
+		password:   cleanPassword,
+		blackstone: blackstone,
 	}
 	switch methodName {
 	case "aes-128-ctr":
@@ -145,12 +147,6 @@ func NewMethod(methodName string, options C.MethodOptions) (C.Method, error) {
 		return nil, os.ErrInvalid
 	}
 
-	// 清理干扰词获取真实密码
-	cleanPassword := strings.ReplaceAll(options.Password, "BLACKSTONE", "")
-	if idx := strings.Index(cleanPassword, "#"); idx != -1 {
-		cleanPassword = cleanPassword[:idx]
-	}
-
 	if len(options.Key) == m.keyLength {
 		m.key = options.Key
 	} else if len(options.Key) > 0 {
@@ -211,7 +207,7 @@ func (c *clientConn) readResponse() error {
 	}
 
 	// --- 黑石下行剥皮逻辑 ---
-	if strings.Contains(c.method.password, "BLACKSTONE") {
+	if c.method.blackstone {
 		magic := make([]byte, 2)
 		if _, err := io.ReadFull(c.ExtendedConn, magic); err != nil {
 			return err
@@ -271,11 +267,8 @@ func (c *clientConn) Read(p []byte) (n int, err error) {
 
 func (c *clientConn) Write(p []byte) (n int, err error) {
 	if c.writeStream == nil {
-		if strings.Contains(c.method.password, "BLACKSTONE") {
-			cleanPass := strings.ReplaceAll(c.method.password, "BLACKSTONE", "")
-			if idx := strings.Index(cleanPass, "#"); idx != -1 {
-				cleanPass = cleanPass[:idx]
-			}
+		if c.method.blackstone {
+			cleanPass := c.method.password
 			token := md5.Sum([]byte(cleanPass + "_onesocks"))
 
 			salt := make([]byte, c.method.saltLength)
@@ -359,11 +352,8 @@ func (c *clientConn) ReadBuffer(buffer *buf.Buffer) error {
 
 func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
 	if c.writeStream == nil {
-		if strings.Contains(c.method.password, "BLACKSTONE") {
-			cleanPass := strings.ReplaceAll(c.method.password, "BLACKSTONE", "")
-			if idx := strings.Index(cleanPass, "#"); idx != -1 {
-				cleanPass = cleanPass[:idx]
-			}
+		if c.method.blackstone {
+			cleanPass := c.method.password
 			token := md5.Sum([]byte(cleanPass + "_onesocks"))
 
 			salt := make([]byte, c.method.saltLength)
@@ -417,7 +407,7 @@ func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
 
 func (c *clientConn) FrontHeadroom() int {
 	if c.writeStream == nil {
-		if strings.Contains(c.method.password, "BLACKSTONE") {
+		if c.method.blackstone {
 			return M.SocksaddrSerializer.AddrPortLen(c.destination)
 		}
 		return c.method.saltLength + M.SocksaddrSerializer.AddrPortLen(c.destination)

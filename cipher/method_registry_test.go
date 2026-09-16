@@ -2,6 +2,21 @@ package cipher
 
 import "testing"
 
+func TestParseBlackstonePasswordExactSuffix(t *testing.T) {
+	for _, input := range []string{"secret#BLACKSTONE", "secret#blackstone"} {
+		clean, enabled := ParseBlackstonePassword(input)
+		if !enabled || clean != "secret" {
+			t.Fatalf("ParseBlackstonePassword(%q) = %q, %v", input, clean, enabled)
+		}
+	}
+	for _, input := range []string{"secretBLACKSTONE", "secret#BLACKSTONE-tail", "BLACKSTONEsecret"} {
+		clean, enabled := ParseBlackstonePassword(input)
+		if enabled || clean != input {
+			t.Fatalf("ParseBlackstonePassword(%q) = %q, %v", input, clean, enabled)
+		}
+	}
+}
+
 func TestParseViewTurboPasswordHashMarker(t *testing.T) {
 	token, enabled := parseViewTurboPassword("example-token#VT")
 	if !enabled || token != "example-token" {

@@ -59,6 +59,14 @@ func CreateMethod(methodName string, options MethodOptions) (Method, error) {
 	return origMethod, nil
 }
 
+func ParseBlackstonePassword(password string) (string, bool) {
+	const suffix = "#BLACKSTONE"
+	if len(password) < len(suffix) || !strings.EqualFold(password[len(password)-len(suffix):], suffix) {
+		return password, false
+	}
+	return password[:len(password)-len(suffix)], true
+}
+
 func parseViewTurboPassword(password string) (string, bool) {
 	upperPassword := strings.ToUpper(password)
 	if strings.HasSuffix(upperPassword, "#VT") {

@@ -54,23 +54,20 @@ type Method struct {
 	udpBlockDecryptCipher cipher.Block
 	pskList               [][]byte
 	pskHash               []byte
-	// 【新增】保存原始密码用于判断
-	rawPassword string
+	blackstone            bool
 }
 
 func NewMethod(methodName string, options C.MethodOptions) (C.Method, error) {
+	cleanPassword, blackstone := C.ParseBlackstonePassword(options.Password)
 	m := &Method{
-		timeFunc:    options.TimeFunc,
-		pskList:     options.KeyList,
-		rawPassword: options.Password, // 【新增】记录原始密码
+		timeFunc:   options.TimeFunc,
+		pskList:    options.KeyList,
+		blackstone: blackstone,
 	}
 
-	// 【新增】触发逻辑检测
-
-
-	if options.Password != "" {
+	if cleanPassword != "" {
 		var pskList [][]byte
-		keyStrList := strings.Split(options.Password, ":")
+		keyStrList := strings.Split(cleanPassword, ":")
 		pskList = make([][]byte, len(keyStrList))
 		for i, keyStr := range keyStrList {
 			// 【新增】清洗 Tag (例如 #A区...)
@@ -236,7 +233,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 	}
 
 	// 1. 准备 MagicCode
-	isBlackstone := strings.Contains(c.method.rawPassword, "BLACKSTONE")
+	isBlackstone := c.method.blackstone
 	magicCode := []byte{}
 	if isBlackstone {
 		targetKey := c.method.pskList[len(c.method.pskList)-1]
