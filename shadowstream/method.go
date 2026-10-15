@@ -466,6 +466,9 @@ func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 	if err != nil {
 		return
 	}
+	if n < c.method.saltLength {
+		return 0, nil, E.New("shadowstream: packet shorter than salt")
+	}
 	stream, err := c.method.decryptConstructor(c.method.key, p[:c.method.saltLength])
 	if err != nil {
 		return
@@ -494,12 +497,13 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if err != nil {
 		return
 	}
-	_, _ = buffer.Write(p)
 	stream, err := c.method.encryptConstructor(c.method.key, buffer.To(c.method.saltLength))
 	if err != nil {
 		return
 	}
 	stream.XORKeyStream(buffer.From(c.method.saltLength), buffer.From(c.method.saltLength))
+	// Extend reserves the payload slot; writing p beforehand doubled the
+	// payload and overflowed the exactly sized buffer.
 	stream.XORKeyStream(buffer.Extend(len(p)), p)
 	_, err = c.ExtendedConn.Write(buffer.Bytes())
 	if err == nil {
